@@ -1,0 +1,158 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths: ['python-app/**', 'node-app/**', '.github/workflows/ci-cd.yml']
+  pull_request:
+    branches: [main]
+    paths: ['python-app/**', 'node-app/**', '.github/workflows/ci-cd.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+      node: ${{ steps.filter.outputs.node }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            python:
+              - 'python-app/**'
+              - '.github/workflows/ci-cd.yml'
+            node:
+              - 'node-app/**'
+              - '.github/workflows/ci-cd.yml'
+
+  python:
+    needs: changes
+    if: needs.changes.outputs.python == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    defaults:
+      run:
+        working-directory: python-app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: python-app/requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: |
+          ruff check .
+          flake8 .
+      - name: Test with coverage
+        run: pytest --cov=app --cov-report=term --cov-report=xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage-${{ matrix.python-version }}
+          path: python-app/coverage.xml
+
+  node:
+    needs: changes
+    if: needs.changes.outputs.node == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 20, 22]
+    defaults:
+      run:
+        working-directory: node-app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: node-app/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+  docker-python:
+    needs: python
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: python-app
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: |
+            ghcr.io/shubhamkhedkar/cicd-python-app:latest
+            ghcr.io/shubhamkhedkar/cicd-python-app:${{ github.sha }}
+          cache-from: type=gha,scope=python
+          cache-to: type=gha,mode=max,scope=python
+
+  docker-node:
+    needs: node
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: node-app
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: |
+            ghcr.io/shubhamkhedkar/cicd-node-app:latest
+            ghcr.io/shubhamkhedkar/cicd-node-app:${{ github.sha }}
+          cache-from: type=gha,scope=node
+          cache-to: type=gha,mode=max,scope=node
+
+  deploy:
+    needs: [docker-python, docker-node]
+    if: >-
+      always() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' &&
+      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deployment summary
+        run: |
+          {
+            echo "## Deployment summary"
+            echo "| Image | Build result |"
+            echo "|---|---|"
+            echo "| ghcr.io/shubhamkhedkar/cicd-python-app:${GITHUB_SHA} | ${{ needs.docker-python.result }} |"
+            echo "| ghcr.io/shubhamkhedkar/cicd-node-app:${GITHUB_SHA} | ${{ needs.docker-node.result }} |"
+            echo ""
+            echo "Commit: \`${GITHUB_SHA}\` by @${GITHUB_ACTOR}"
+          } >> "$GITHUB_STEP_SUMMARY"
